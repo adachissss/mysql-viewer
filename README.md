@@ -35,6 +35,21 @@ mysql-viewer/
 - Python 3.8+
 - MySQL 5.7+ / 8.0+
 
+## 连接池配置
+
+后端已启用基于 mysql-connector-python 的连接池，并按连接参数（host/port/user/password）分池。
+
+可通过环境变量调整：
+
+- `DB_POOL_SIZE`：每个连接池的连接数，默认 `5`
+- `DB_MAX_POOLS`：最大活跃连接池数量，默认 `32`
+- `DB_CONNECTION_TIMEOUT`：连接超时秒数，默认 `10`
+
+说明：
+
+- `database` 不作为分池键，避免为同一账号的不同库重复创建连接池。
+- 每次请求结束后调用 `conn.close()`，在连接池模式下会归还连接，而不是销毁底层连接。
+
 ## 安装与启动
 
 1. 创建虚拟环境（可选）

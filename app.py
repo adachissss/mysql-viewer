@@ -1,8 +1,56 @@
 from flask import Flask, render_template, request, jsonify
+import hashlib
+import os
+from threading import Lock
 import mysql.connector
 from mysql.connector import Error
+from mysql.connector import pooling
 
 app = Flask(__name__)
+
+DB_POOL_SIZE = int(os.getenv('DB_POOL_SIZE', '5'))
+DB_MAX_POOLS = int(os.getenv('DB_MAX_POOLS', '32'))
+DB_CONNECTION_TIMEOUT = int(os.getenv('DB_CONNECTION_TIMEOUT', '10'))
+
+_POOLS = {}
+_POOL_LOCK = Lock()
+
+
+def _pool_key(host, port, user, password):
+    normalized_port = int(port) if port else 3306
+    return (str(host or 'localhost'), normalized_port, str(user or ''), str(password or ''))
+
+
+def _pool_name_for_key(key):
+    raw = '|'.join([str(v) for v in key])
+    digest = hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]
+    return f"mysql_viewer_{digest}"
+
+
+def _get_or_create_pool(host, port, user, password):
+    key = _pool_key(host, port, user, password)
+
+    with _POOL_LOCK:
+        pool = _POOLS.get(key)
+        if pool is not None:
+            return pool
+
+        if len(_POOLS) >= DB_MAX_POOLS:
+            oldest_key = next(iter(_POOLS))
+            del _POOLS[oldest_key]
+
+        pool = pooling.MySQLConnectionPool(
+            pool_name=_pool_name_for_key(key),
+            pool_size=DB_POOL_SIZE,
+            pool_reset_session=True,
+            host=key[0],
+            port=key[1],
+            user=key[2],
+            password=key[3],
+            connection_timeout=DB_CONNECTION_TIMEOUT
+        )
+        _POOLS[key] = pool
+        return pool
 
 
 def quote_identifier(name):
@@ -13,14 +61,12 @@ def quote_identifier(name):
 
 def get_db_connection(host, port, user, password, database=None):
     try:
-        conn = mysql.connector.connect(
-            host=host,
-            port=int(port) if port else 3306,
-            user=user,
-            password=password,
-            database=database,
-            connection_timeout=10
-        )
+        pool = _get_or_create_pool(host, port, user, password)
+        conn = pool.get_connection()
+        if isinstance(database, str) and database.strip():
+            cursor = conn.cursor()
+            cursor.execute(f"USE {quote_identifier(database.strip())}")
+            cursor.close()
         return conn
     except Error as e:
         return str(e)
@@ -78,11 +124,19 @@ def list_tables():
     )
     if isinstance(conn, str):
         return jsonify({'success': False, 'error': conn})
-    cursor = conn.cursor()
-    cursor.execute("SHOW TABLES")
-    tables = [row[0] for row in cursor.fetchall()]
-    cursor.close()
-    conn.close()
+
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SHOW TABLES")
+        tables = [row[0] for row in cursor.fetchall()]
+    except Error as e:
+        return jsonify({'success': False, 'error': str(e)})
+    finally:
+        if cursor is not None:
+            cursor.close()
+        conn.close()
+
     return jsonify({'success': True, 'tables': tables})
 
 
@@ -333,6 +387,7 @@ def update_cell():
         conn.close()
         return jsonify({'success': False, 'error': 'Primary key required for update'})
 
+    cursor = None
     try:
         qt = quote_identifier(table_name)
         qc = quote_identifier(column_name)
@@ -347,12 +402,13 @@ def update_cell():
         cursor.execute(sql, params)
         conn.commit()
         affected = cursor.rowcount
-        cursor.close()
     except Exception as e:
-        conn.close()
         return jsonify({'success': False, 'error': str(e)})
+    finally:
+        if cursor is not None:
+            cursor.close()
+        conn.close()
 
-    conn.close()
     if affected == 0:
         return jsonify({'success': False, 'error': 'No row updated'})
     return jsonify({'success': True})
@@ -377,6 +433,7 @@ def delete_row():
         conn.close()
         return jsonify({'success': False, 'error': 'Primary key required for delete'})
 
+    cursor = None
     try:
         qt = quote_identifier(table_name)
         where_parts = []
@@ -390,12 +447,13 @@ def delete_row():
         cursor.execute(sql, params)
         conn.commit()
         affected = cursor.rowcount
-        cursor.close()
     except Exception as e:
-        conn.close()
         return jsonify({'success': False, 'error': str(e)})
+    finally:
+        if cursor is not None:
+            cursor.close()
+        conn.close()
 
-    conn.close()
     if affected == 0:
         return jsonify({'success': False, 'error': 'No row deleted'})
     return jsonify({'success': True})
