@@ -5,6 +5,8 @@ let conn = { host: '', port: '', user: '', password: '', database: '' };
 let currentTables = {};
 let contextActions = [];
 let activeCellEditor = null;
+const DEFAULT_PAGE_SIZE = 50;
+const PAGE_SIZE_OPTIONS = [50, 100, 200];
 
 // Load cached connection on start
 (function loadCached() {
@@ -40,6 +42,19 @@ function formatValue(v) {
     if (v === null || v === undefined) return '<span class="cell-null">NULL</span>';
     if (typeof v === 'object') return JSON.stringify(v);
     return String(v);
+}
+
+function getTablePageSize(name) {
+    const tableState = currentTables[name] || {};
+    const pageSize = Number(tableState.pageSize || 0);
+    if (PAGE_SIZE_OPTIONS.includes(pageSize)) return pageSize;
+    return DEFAULT_PAGE_SIZE;
+}
+
+function setTablePageSize(name, pageSize) {
+    if (!currentTables[name]) currentTables[name] = {};
+    const normalized = Number(pageSize);
+    currentTables[name].pageSize = PAGE_SIZE_OPTIONS.includes(normalized) ? normalized : DEFAULT_PAGE_SIZE;
 }
 
 function hideContextMenu() {
@@ -350,38 +365,64 @@ async function loadTableSchema(name, card) {
 }
 
 async function loadTableDataOffset(name, card, offset) {
+    const limit = getTablePageSize(name);
+    const normalizedOffset = Math.max(0, Number(offset) || 0);
     card.querySelector('.tab-content[data-tab="data"]').innerHTML = '<div class="loading">Loading...</div>';
     const res = await fetch('/api/table_data', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...conn, table: name, limit: 100, offset: offset })
+        body: JSON.stringify({ ...conn, table: name, limit: limit, offset: normalizedOffset, include_total: false })
     });
     const json = await res.json();
     if (!json.success) {
         card.querySelector('.tab-content[data-tab="data"]').innerHTML = `<div class="error">${json.error}</div>`;
         return;
     }
+    setTablePageSize(name, json.limit || limit);
+    currentTables[name].data = json;
+    renderTableSchema(card, name, 'data');
+}
+
+async function loadTableDataOffsetWithTotal(name, card, offset) {
+    const limit = getTablePageSize(name);
+    const normalizedOffset = Math.max(0, Number(offset) || 0);
+    card.querySelector('.tab-content[data-tab="data"]').innerHTML = '<div class="loading">Loading...</div>';
+    const res = await fetch('/api/table_data', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...conn, table: name, limit: limit, offset: normalizedOffset, include_total: true })
+    });
+    const json = await res.json();
+    if (!json.success) {
+        card.querySelector('.tab-content[data-tab="data"]').innerHTML = `<div class="error">${json.error}</div>`;
+        return;
+    }
+    setTablePageSize(name, json.limit || limit);
     currentTables[name].data = json;
     renderTableSchema(card, name, 'data');
 }
 
 async function loadTableData(name, card, page = 1) {
-    const limit = 100;
+    const limit = getTablePageSize(name);
     const offset = (page - 1) * limit;
-    card.querySelector('.table-body').innerHTML = '<div class="loading">Loading data...</div>';
-    const res = await fetch('/api/table_data', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...conn, table: name, limit: limit, offset: offset })
-    });
-    const json = await res.json();
-    if (!json.success) {
-        card.querySelector('.table-body').innerHTML = `<div class="error">${json.error}</div>`;
-        return;
-    }
-    currentTables[name].data = json;
+    await loadTableDataOffsetWithTotal(name, card, offset);
     currentTables[name].page = page;
-    renderTableSchema(card, name, 'data', page);
+    card.classList.add('open');
+}
+
+async function changePageSize(name, pageSize) {
+    const card = document.querySelector(`.table-card[data-table="${name}"]`);
+    if (!card) return;
+    setTablePageSize(name, pageSize);
+    await loadTableDataOffsetWithTotal(name, card, 0);
+    card.classList.add('open');
+}
+
+async function countTableTotal(name) {
+    const card = document.querySelector(`.table-card[data-table="${name}"]`);
+    if (!card) return;
+    const offset = (currentTables[name] && currentTables[name].data && currentTables[name].data.offset) || 0;
+    await loadTableDataOffsetWithTotal(name, card, offset);
     card.classList.add('open');
 }
 
@@ -399,7 +440,6 @@ function switchTab(card, name, tab) {
 function renderTableSchema(card, name, mode, page = 1) {
     const schema = currentTables[name].schema;
     const data = currentTables[name].data;
-    const limit = 100;
     const activeTab = mode === 'data' ? 'data' : 'schema';
 
     let schemaHtml = '';
@@ -426,16 +466,33 @@ function renderTableSchema(card, name, mode, page = 1) {
     let dataHtml = '<div class="loading">Click Data tab to load</div>';
     if (data) {
         const total = data.total;
+        const totalMode = data.total_mode || 'none';
         const offset = data.offset || 0;
+        const limit = data.limit || getTablePageSize(name);
         const currentPage = data.current_page || 1;
         const showing = data.rows.length;
+        const hasNext = !!data.has_next;
+        const summaryText = totalMode === 'exact'
+            ? `${total} rows total, showing ${showing > 0 ? `${offset + 1}-${offset + showing}` : '0'}`
+            : `Total not counted, showing ${showing > 0 ? `${offset + 1}-${offset + showing}` : '0'}`;
+        const sizeOptions = PAGE_SIZE_OPTIONS.map(size =>
+            `<option value="${size}" ${size === limit ? 'selected' : ''}>${size}</option>`
+        ).join('');
         const rows2 = data.rows.map((r, rowIndex) =>
             `<tr data-row-index="${rowIndex}" oncontextmenu="showRowContextMenu(event, '${name}', ${rowIndex})">` +
             r.map((v, colIndex) => `<td ondblclick="editCell(this, '${name}', ${rowIndex}, ${colIndex})">${formatValue(v)}</td>`).join('') +
             '</tr>'
         ).join('');
         dataHtml = `
-            <div class="data-summary">${total} rows total, showing ${showing > 0 ? `${offset + 1}-${offset + showing}` : '0'}</div>
+            <div class="data-toolbar">
+                <div class="data-summary">${summaryText}</div>
+                <div class="data-controls">
+                    <label>Page size
+                        <select onchange="changePageSize('${name}', this.value)">${sizeOptions}</select>
+                    </label>
+                    <button onclick="countTableTotal('${name}')" ${totalMode === 'exact' ? 'disabled' : ''}>Count total</button>
+                </div>
+            </div>
             <table>
                 <thead><tr>${data.columns.map(c => `<th>${c}</th>`).join('')}</tr></thead>
                 <tbody>${rows2}</tbody>
@@ -443,7 +500,7 @@ function renderTableSchema(card, name, mode, page = 1) {
             <div class="pagination">
                 <button onclick="loadTableDataOffset('${name}', document.querySelector('.table-card[data-table=&quot;${name}&quot;]'), ${offset - limit})" ${offset <= 0 ? 'disabled' : ''}>Prev</button>
                 <span>Page ${currentPage}</span>
-                <button onclick="loadTableDataOffset('${name}', document.querySelector('.table-card[data-table=&quot;${name}&quot;]'), ${offset + limit})" ${offset + limit >= total ? 'disabled' : ''}>Next</button>
+                <button onclick="loadTableDataOffset('${name}', document.querySelector('.table-card[data-table=&quot;${name}&quot;]'), ${offset + limit})" ${hasNext ? '' : 'disabled'}>Next</button>
             </div>`;
     }
 

@@ -122,9 +122,34 @@ def table_data():
     )
     if isinstance(conn, str):
         return jsonify({'success': False, 'error': conn})
+
+    def parse_int(value, default, minimum=None, maximum=None):
+        try:
+            num = int(value)
+        except (TypeError, ValueError):
+            num = default
+        if minimum is not None:
+            num = max(minimum, num)
+        if maximum is not None:
+            num = min(maximum, num)
+        return num
+
+    def parse_bool(value, default=False):
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in ('1', 'true', 'yes', 'on')
+        return default
+
     cursor = conn.cursor()
     table_name = data.get('table', '')
-    limit = min(int(data.get('limit', 100)), 500)
+    limit = parse_int(data.get('limit', 50), 50, minimum=1, maximum=500)
+    offset = parse_int(data.get('offset', 0), 0, minimum=0)
+    include_total = parse_bool(data.get('include_total'), default=(offset == 0))
 
     try:
         qt = quote_identifier(table_name)
@@ -135,17 +160,22 @@ def table_data():
         primary_keys = [row['Column_name'] for row in key_cursor.fetchall()]
         key_cursor.close()
 
-        # 先查总条数
-        count_cursor = conn.cursor()
-        count_cursor.execute(f"SELECT COUNT(*) FROM {qt}")
-        total = count_cursor.fetchone()[0]
-        count_cursor.close()
-
-        # 再查数据
-        offset = min(int(data.get('offset', 0)), total)
-        cursor.execute(f"SELECT * FROM {qt} LIMIT {limit} OFFSET {offset}")
+        # Use limit + 1 rows to determine whether a next page exists.
+        cursor.execute(f"SELECT * FROM {qt} LIMIT {limit + 1} OFFSET {offset}")
         columns = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
+        has_next = len(rows) > limit
+        rows = rows[:limit]
+
+        total = None
+        total_mode = 'none'
+        if include_total:
+            count_cursor = conn.cursor()
+            count_cursor.execute(f"SELECT COUNT(*) FROM {qt}")
+            total = count_cursor.fetchone()[0]
+            count_cursor.close()
+            total_mode = 'exact'
+
         current_page = int(offset / limit) + 1
     except Error as e:
         cursor.close()
@@ -160,6 +190,8 @@ def table_data():
         'rows': [list(r) for r in rows],
         'primary_keys': primary_keys,
         'total': total,
+        'total_mode': total_mode,
+        'has_next': has_next,
         'limit': limit,
         'offset': offset,
         'current_page': current_page
